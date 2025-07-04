@@ -7,8 +7,24 @@
 #include <YoseenSDK/YoseenSDK.h>
 #include <string.h>
 
+#include <fcntl.h>        // open, O_RDWR
+#include <unistd.h>       // close, read, write
+#include <sys/mman.h>     // mmap, PROT_READ, PROT_WRITE, MAP_SHARED, MAP_FAILED
+#include <sys/stat.h>     // optional: fstat
+#include <sys/types.h>    // optional: off_t, size_t
+
 static ros::Publisher image_pub;
 static ros::Publisher temp_pub;
+
+static sensor_msgs::ImagePtr latest_img_msg;
+static std_msgs::Float32MultiArray latest_temp_msg;
+static bool new_data_available = false;
+
+struct time_stamp {
+  int64_t high;
+  int64_t low;
+};
+time_stamp *pointt;
 
 struct ShellView {
     s32 userHandle;                           //用户句柄
@@ -42,6 +58,15 @@ static void tempToPseudoColor(const s16* tempData, int width, int height, cv::Ma
 static void __stdcall previewCallback(s32 errorCode, DataFrame* frame, void* customData) {
     if (errorCode != 0 || frame == nullptr) return;
 
+    ros::Time rcv_time;
+    if (pointt != MAP_FAILED && pointt->low != 0) {
+        int64_t b = pointt->low;
+        double time_pc = b / 1000000000.0;
+        rcv_time = ros::Time(time_pc);
+    } else {
+        rcv_time = ros::Time::now();
+    }
+
     DataFrameHeader* tempHead = (DataFrameHeader*)frame->Head;
     s16* tempData = (s16*)frame->Temp;
 
@@ -55,9 +80,9 @@ static void __stdcall previewCallback(s32 errorCode, DataFrame* frame, void* cus
     tempToPseudoColor(tempData, width, height, colorImg);
     
     std_msgs::Header header;
-    header.stamp = ros::Time::now();
-    sensor_msgs::ImagePtr imgMsg = cv_bridge::CvImage(header, "bgr8", colorImg).toImageMsg();
-    image_pub.publish(imgMsg);
+    header.stamp = rcv_time;
+
+    latest_img_msg = cv_bridge::CvImage(header, "bgr8", colorImg).toImageMsg();
 
     std_msgs::Float32MultiArray tempMsg;
     tempMsg.layout.dim.resize(2);
@@ -73,7 +98,8 @@ static void __stdcall previewCallback(s32 errorCode, DataFrame* frame, void* cus
         tempMsg.data[i] = float(tempData[i]) / Slope + Offset; // 温度浮点值 = 温度整数值 / Slope + Offset
         // tempMsg.data[i] = tempData[i] / 20.0f;
     }
-    temp_pub.publish(tempMsg);
+    latest_temp_msg = tempMsg;
+    new_data_available = true;
 }
 
 int main(int argc, char** argv) {
@@ -82,6 +108,12 @@ int main(int argc, char** argv) {
 
     image_pub = nh.advertise<sensor_msgs::Image>("/thermal/image", 1);
     temp_pub  = nh.advertise<std_msgs::Float32MultiArray>("/thermal/temperature", 1);
+
+    const char *user_name = getlogin();
+    std::string path_for_time_stamp = "/home/" + std::string(user_name) + "/timeshare";
+    const char *shared_file_name = path_for_time_stamp.c_str();
+    int fd = open(shared_file_name, O_RDWR);
+    pointt = (time_stamp *)mmap(NULL, sizeof(time_stamp), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
     // 初始化 SDK
     Yoseen_InitSDK();
@@ -114,7 +146,20 @@ int main(int argc, char** argv) {
     _shellView.previewHandle = previewHandle;
 
     ROS_INFO("Yoseen thermal streaming started...");
-    ros::spin();
+    ros::Rate loop_rate(10);  // 10Hz 发布频率
+
+    while (ros::ok()) {
+        if (new_data_available) {
+            // 发布最新的图像和温度数据
+            image_pub.publish(latest_img_msg);
+            temp_pub.publish(latest_temp_msg);
+            new_data_available = false;  // 重置标志位
+        }
+
+        ros::spinOnce();  // 处理回调队列
+        loop_rate.sleep();  // 等待下一次循环
+    }
+
 
     // 清理资源
     if (_shellView.previewHandle >= 0) {
